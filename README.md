@@ -2,10 +2,10 @@
 
 A **production-quality, embedding-free filesystem indexing engine** for AI agents.
 
-Converts a local codebase into a persistent, BM25-searchable SQLite database so language models can retrieve relevant code context without re-exploring the repository on every request.
+Converts a local directory — source code, PDFs, spreadsheets, Word documents, or any mix — into a persistent, BM25-searchable SQLite database so language models can retrieve relevant context without re-exploring the repository on every request.
 
 ```
-ctx index .          # index a codebase
+ctx index .          # index any directory
 ctx search "jwt"     # retrieve relevant chunks instantly
 ```
 
@@ -21,23 +21,30 @@ ctx search "jwt"     # retrieve relevant chunks instantly
                         │
           ┌─────────────▼─────────────┐
           │    Indexing Pipeline      │
-          │  scan → diff → chunk      │
-          │  → persist (atomic)       │
+          │  scan → diff → extract   │
+          │  → chunk → persist        │
           └──────┬──────────┬─────────┘
                  │          │
     ┌────────────▼──┐  ┌────▼───────────────┐
     │    Scanner    │  │   Fingerprinter     │
     │  os.walk +    │  │  SHA-256 hashing    │
     │  ignore rules │  │  change detection   │
-    └───────────────┘  └────────────────────┘
-                 │
-    ┌────────────▼──────────┐
+    └───────┬───────┘  └────────────────────┘
+            │
+    ┌───────▼───────────────┐
+    │      Extractor        │
+    │  plain text: UTF-8    │
+    │  rich docs: markitdown│
+    │  (PDF/DOCX/XLSX/…)    │
+    └───────┬───────────────┘
+            │
+    ┌───────▼───────────────┐
     │       Chunker         │
     │  line-aligned slices  │
     │  configurable overlap │
-    └────────────┬──────────┘
-                 │
-    ┌────────────▼──────────────────────────┐
+    └────────┬──────────────┘
+             │
+    ┌────────▼──────────────────────────────┐
     │         Storage Layer                 │
     │                                       │
     │  SQLite  ┌──────────┐  ┌──────────┐   │
@@ -52,7 +59,8 @@ ctx search "jwt"     # retrieve relevant chunks instantly
                                 │
     ┌───────────────────────────▼───────────┐
     │          Search Engine                │
-    │   FTS5 MATCH + bm25() ranking        │
+    │  FTS5 MATCH + bm25() ranking          │
+    │  file-level deduplication             │
     └───────────────────────────────────────┘
 ```
 
@@ -61,15 +69,15 @@ ctx search "jwt"     # retrieve relevant chunks instantly
 ```
 Filesystem
     │
-    ▼ Scanner          → [DiscoveredFile, ...]
+    ▼ Scanner       → [DiscoveredFile, ...]          (skips binaries, ignored dirs)
     │
-    ▼ Fingerprinter    → ChangeSet (new / modified / deleted)
+    ▼ Fingerprinter → ChangeSet (new / modified / deleted)
     │
-    ▼ File Read        → raw text (UTF-8 → latin-1 fallback)
+    ▼ Extractor     → plain text or Markdown         (UTF-8 / latin-1 / markitdown)
     │
-    ▼ Chunker          → [Chunk(path, start_line, end_line, content), ...]
+    ▼ Chunker       → [Chunk(path, start_line, end_line, content), ...]
     │
-    ▼ Repository       → SQLite  (transactional upsert + FTS5 trigger sync)
+    ▼ Repository    → SQLite                         (transactional upsert + FTS5 sync)
 ```
 
 ### SQLite Schema
@@ -113,20 +121,23 @@ context-db/
 │   ├── models.py            # Pydantic data models (shared)
 │   ├── cli.py               # Typer CLI entry-point
 │   ├── indexer/
-│   │   ├── scanner.py       # Filesystem traversal
+│   │   ├── scanner.py       # Filesystem traversal + ignore rules
 │   │   ├── fingerprint.py   # SHA-256 hashing + change detection
+│   │   ├── extractor.py     # Rich-format text extraction (markitdown)
 │   │   ├── chunker.py       # Line-aligned character chunking
-│   │   └── pipeline.py      # Orchestration: scan→diff→chunk→persist
+│   │   └── pipeline.py      # Orchestration: scan→diff→extract→chunk→persist
 │   ├── storage/
 │   │   ├── db.py            # SQLite connection + migrations
 │   │   └── repository.py    # Repository pattern (all SQL here)
 │   └── retrieval/
-│       └── search.py        # FTS5 + BM25 search engine
+│       └── search.py        # FTS5 + BM25 search, file-level deduplication
 ├── tests/
 │   ├── conftest.py
+│   ├── helpers.py
 │   ├── test_scanner.py
 │   ├── test_fingerprint.py
 │   ├── test_chunker.py
+│   ├── test_extractor.py
 │   ├── test_storage.py
 │   ├── test_pipeline.py
 │   ├── test_search.py
@@ -172,12 +183,15 @@ CTX_DB=/path/to/myindex.db uv run ctx init
 ```bash
 uv run ctx index .
 uv run ctx index /path/to/repo
+uv run ctx index ~/Documents/project
 
 # With options:
 uv run ctx index . --chunk-chars 2000 --overlap 5
 uv run ctx index . --ignore "*.test.ts" --ignore "fixtures/**"
 uv run ctx index . --verbose          # enable DEBUG logging
 ```
+
+Any directory on your filesystem is supported. The scanner walks the full tree from the given root and handles all supported file formats automatically.
 
 Example output:
 
@@ -196,14 +210,17 @@ Subsequent runs are **incremental** — only new or modified files are re-indexe
 
 ### Search
 
+By default each file appears **at most once** in results, shown by its best-matching chunk. Use `--all-chunks` when you want every matching chunk (e.g. to build a multi-chunk context window for an LLM).
+
 ```bash
 uv run ctx search "jwt"
 uv run ctx search "verify token" --limit 5
-uv run ctx search "auth*" --path "%.py"   # restrict to Python files
-uv run ctx search "jwt" --json            # machine-readable output
+uv run ctx search "auth*" --path "%.py"      # restrict to Python files
+uv run ctx search "jwt" --json               # machine-readable output
+uv run ctx search "jwt" --all-chunks         # all matching chunks, files may repeat
 ```
 
-The search engine uses SQLite's native **BM25** ranking, which prefers chunks with higher term density and rarity. Queries support FTS5 operators:
+The search engine uses SQLite's native **BM25** ranking. Queries support FTS5 operators:
 
 | Syntax | Effect |
 |--------|--------|
@@ -237,6 +254,38 @@ uv run ctx reset --yes    # non-interactive
 
 ---
 
+## Supported File Formats
+
+### Plain text (always indexed)
+
+Any file whose content is valid UTF-8 or latin-1 text — `.py`, `.ts`, `.js`, `.go`, `.rs`, `.md`, `.yaml`, `.json`, `.toml`, `.sql`, `.sh`, and hundreds more.
+
+### Rich documents (converted to Markdown via markitdown)
+
+| Format | Extensions | What is extracted |
+|--------|------------|-------------------|
+| PDF | `.pdf` | Text layer; OCR fallback |
+| Word | `.docx`, `.doc` | Paragraphs, tables |
+| Excel | `.xlsx`, `.xls` | Sheet names, cell values |
+| PowerPoint | `.pptx`, `.ppt` | Slide text |
+| HTML | `.html`, `.htm` | Stripped markup |
+| CSV | `.csv` | Rows as Markdown table |
+| XML | `.xml` | Element text content |
+
+All rich formats are converted to Markdown before chunking, so headings, bullet points, and table structure are preserved in the search index.
+
+### Skipped automatically
+
+| Reason | Examples |
+|--------|---------|
+| Binary content (null-byte sniff) | compiled objects, images, audio |
+| File size > 16 MB | very large data files |
+| Compiled artefacts | `.pyc`, `.so`, `.dll`, `.exe` |
+| Media files | `.png`, `.jpg`, `.mp4`, `.mp3` |
+| Dependency directories | `node_modules/`, `.git/`, `__pycache__/`, `.venv/` |
+
+---
+
 ## Configuration
 
 | Env var | Default | Description |
@@ -254,37 +303,7 @@ uv run pytest --cov=context_db            # with coverage
 uv run pytest -x -q                       # fail-fast
 ```
 
-Coverage target: **≥ 90%** (currently 97%).
-
----
-
-## Supported File Formats
-
-### Plain text (always indexed)
-
-Any file whose content is valid UTF-8 or latin-1 text — `.py`, `.ts`, `.js`,
-`.go`, `.rs`, `.md`, `.yaml`, `.json`, `.toml`, `.sql`, `.sh`, and hundreds more.
-
-### Rich documents (converted via markitdown)
-
-| Format | Extensions | What is extracted |
-|--------|------------|-------------------|
-| PDF | `.pdf` | Text layer; OCR fallback |
-| Word | `.docx`, `.doc` | Paragraphs, tables |
-| Excel | `.xlsx`, `.xls` | Sheet names, cell values |
-| PowerPoint | `.pptx`, `.ppt` | Slide text |
-| HTML | `.html`, `.htm` | Stripped markup (Markdown) |
-| CSV | `.csv` | Rows as Markdown table |
-| XML | `.xml` | Element text content |
-
-All rich formats are converted to Markdown before chunking, so headings,
-bullet points, and table structure are preserved in the search index.
-
-### Skipped
-
-Binary files (null-byte sniff), files > 4 MB, compiled artefacts
-(`.pyc`, `.so`, `.dll`, …), media (`.png`, `.mp4`, …), and dependency
-directories (`node_modules/`, `.git/`, `__pycache__/`, …).
+Coverage target: **≥ 90%** (currently 97%, 158 tests).
 
 ---
 
@@ -294,6 +313,7 @@ directories (`node_modules/`, `.git/`, `__pycache__/`, …).
 - **Embedding-free** — pure BM25 keyword search via SQLite FTS5.
 - **Incremental by default** — SHA-256 hashing skips unchanged files.
 - **Atomic writes** — each file update is a single SQLite transaction.
+- **File-level results** — search deduplicates by file so each file appears once.
 - **Clean interfaces** — each subsystem has a single responsibility and well-defined input/output types.
 
 ---
