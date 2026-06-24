@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -147,3 +147,49 @@ class IndexStats(BaseModel):
     file_count: int
     chunk_count: int
     db_size_bytes: int
+
+
+# ---------------------------------------------------------------------------
+# Hybrid retrieval
+# ---------------------------------------------------------------------------
+
+
+class ChunkFileInfo(BaseModel):
+    """Chunk data joined with its source file path — used by hybrid retrieval."""
+
+    chunk_id: int
+    path: Path
+    start_line: int
+    end_line: int
+    content: str
+
+    model_config = {"frozen": True}
+
+
+class HybridResult(BaseModel):
+    """A ranked result from hybrid (lexical + semantic) search."""
+
+    path: Path
+    score: float  # weighted combination of normalised lexical + semantic scores
+    match_type: Literal["lexical", "semantic", "hybrid"]
+    start_line: int
+    end_line: int
+    preview: str
+
+    model_config = {"frozen": True}
+
+
+# ---------------------------------------------------------------------------
+# Embedding storage metadata
+# ---------------------------------------------------------------------------
+
+
+class StoredEmbedding(BaseModel):
+    """Metadata row from *chunk_embeddings* (vector not included)."""
+
+    chunk_id: int
+    model: str
+    dimensions: int
+    created_at: int  # Unix timestamp (seconds)
+
+    model_config = {"frozen": True}

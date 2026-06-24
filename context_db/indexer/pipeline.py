@@ -1,8 +1,19 @@
-"""Indexing pipeline: scan → fingerprint → read → chunk → persist.
+"""Indexing pipeline: scan → fingerprint → read → chunk → persist → embed.
 
 The pipeline is intentionally stateless: all state lives in SQLite.  Every
 run determines the minimal set of files to (re-)index by comparing on-disk
 fingerprints against the stored metadata.
+
+Embedding step (optional)
+--------------------------
+When an :class:`~context_db.embeddings.embedder.Embedder` is injected the
+pipeline adds a step after FTS indexing:
+
+* Chunks that already have an embedding for the active model are skipped.
+* New and modified chunks (whose old embeddings were cascade-deleted) are
+  embedded in a single batch call.
+* ``reembed=True`` first wipes all stored vectors for the model so every
+  chunk is re-embedded from scratch.
 
 Progress reporting
 ------------------
@@ -16,7 +27,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import structlog
 
@@ -26,6 +37,9 @@ from context_db.indexer.fingerprint import Fingerprinter
 from context_db.indexer.scanner import Scanner
 from context_db.models import ChangeSet, FileMetadata, IndexStats
 from context_db.storage.repository import Repository
+
+if TYPE_CHECKING:
+    from context_db.embeddings.embedder import Embedder
 
 logger = structlog.get_logger(__name__)
 
@@ -67,6 +81,7 @@ class RunResult:
     errors: int = 0
     duration_s: float = 0.0
     total_chunks: int = 0
+    embedded: int = 0  # chunks that had embeddings generated this run
     changeset: ChangeSet = field(
         default_factory=lambda: ChangeSet(new_files=[], modified_files=[], deleted_paths=[])
     )
@@ -98,11 +113,15 @@ class IndexingPipeline:
         scanner: Scanner | None = None,
         chunker: Chunker | None = None,
         progress_callback: ProgressCallback | None = None,
+        embedder: Embedder | None = None,
+        reembed: bool = False,
     ) -> None:
         self._repo = repository
         self._scanner = scanner or Scanner()
         self._chunker = chunker or Chunker()
         self._progress_cb = progress_callback
+        self._embedder = embedder
+        self._reembed = reembed
 
     # ------------------------------------------------------------------
     # Public API
@@ -186,6 +205,10 @@ class IndexingPipeline:
         if result.indexed or result.deleted:
             self._repo.optimize_fts()
 
+        # ── 8. Generate embeddings (optional) ────────────────────────
+        if self._embedder is not None:
+            result.embedded = self._embed_step()
+
         result.duration_s = time.perf_counter() - t0
         logger.info(
             "pipeline_done",
@@ -216,6 +239,38 @@ class IndexingPipeline:
             return path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             return path.read_text(encoding="latin-1", errors="replace")
+
+    def _embed_step(self) -> int:
+        """Embed all chunks that lack a vector for the active model.
+
+        When ``reembed`` is ``True``, existing vectors are deleted first so
+        every chunk is re-embedded from scratch.
+
+        Returns the number of chunks embedded (0 if already up-to-date).
+        """
+        assert self._embedder is not None
+        model = self._embedder.model_name
+
+        if self._reembed:
+            logger.info("pipeline_reembed", model=model)
+            self._repo.delete_embeddings_for_model(model)
+
+        missing = self._repo.get_chunks_without_embeddings(model)
+        if not missing:
+            logger.debug("pipeline_embed_skip", reason="all_up_to_date", model=model)
+            return 0
+
+        logger.info("pipeline_embed_start", count=len(missing), model=model)
+        contents = [c.content for c in missing]
+        chunk_ids = [c.id for c in missing]
+        try:
+            vectors = self._embedder.embed_batch(contents)
+            self._repo.upsert_embeddings_batch(chunk_ids, vectors, model)
+            logger.info("pipeline_embed_done", embedded=len(missing), model=model)
+            return len(missing)
+        except Exception as exc:
+            logger.error("pipeline_embed_error", error=str(exc), model=model)
+            return 0
 
     def _emit(
         self, current: int, total: int, path: Path, action: str

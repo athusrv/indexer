@@ -23,6 +23,13 @@ chunks_fts   (FTS5 virtual table)
     content   TEXT                  -- mirrors chunks.content
     tokenize  'porter unicode61'    -- stemming + unicode normalisation
 
+chunk_embeddings
+    chunk_id   INTEGER PRIMARY KEY  -- FK → chunks(id) ON DELETE CASCADE
+    embedding  BLOB NOT NULL        -- float32 array, little-endian
+    model      TEXT NOT NULL        -- e.g. "nomic-ai/nomic-embed-text-v1.5"
+    dimensions INTEGER NOT NULL
+    created_at INTEGER NOT NULL     -- Unix timestamp (int seconds)
+
 schema_version
     version   INTEGER PRIMARY KEY   -- monotonic migration counter
 """
@@ -114,6 +121,22 @@ _MIGRATIONS: list[list[str]] = [
         )
         """,
         "INSERT OR IGNORE INTO schema_version(version) VALUES (1)",
+    ],
+    # ── Migration 2: per-chunk vector embeddings ──────────────────────────
+    [
+        """
+        CREATE TABLE IF NOT EXISTS chunk_embeddings (
+            chunk_id   INTEGER PRIMARY KEY,
+            embedding  BLOB    NOT NULL,
+            model      TEXT    NOT NULL,
+            dimensions INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+        )
+        """,
+        # Speeds up "all embeddings for model X" scans used by semantic search.
+        "CREATE INDEX IF NOT EXISTS idx_chunk_embeddings_model ON chunk_embeddings(model)",
+        "INSERT OR IGNORE INTO schema_version(version) VALUES (2)",
     ],
 ]
 

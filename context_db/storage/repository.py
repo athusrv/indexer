@@ -12,18 +12,36 @@ connection is provided the repository uses its own managed connection.
 
 from __future__ import annotations
 
+import array as _array
 import sqlite3
+import time
 from pathlib import Path
 
 import structlog
 
 from context_db.models import (
     Chunk,
+    ChunkFileInfo,
     FileMetadata,
     IndexStats,
     StoredChunk,
     StoredFile,
 )
+
+
+# ---------------------------------------------------------------------------
+# Vector serialisation helpers (stdlib only, float32 little-endian)
+# ---------------------------------------------------------------------------
+
+
+def _vec_to_blob(vector: list[float]) -> bytes:
+    return _array.array("f", vector).tobytes()
+
+
+def _blob_to_vec(blob: bytes) -> list[float]:
+    arr = _array.array("f")
+    arr.frombytes(blob)
+    return list(arr)
 
 logger = structlog.get_logger(__name__)
 
@@ -129,6 +147,51 @@ class Repository:
         """Delete all chunks belonging to *file_id* (FTS triggers handle sync)."""
         self._conn.execute("DELETE FROM chunks WHERE file_id = ?", (file_id,))
 
+    def get_chunk_file_info(self, chunk_ids: list[int]) -> list[ChunkFileInfo]:
+        """Return chunk data joined with file path for the given chunk ids."""
+        if not chunk_ids:
+            return []
+        placeholders = ",".join("?" * len(chunk_ids))
+        rows = self._conn.execute(
+            f"""
+            SELECT c.id, c.start_line, c.end_line, c.content, f.path
+            FROM   chunks c
+            JOIN   files  f ON c.file_id = f.id
+            WHERE  c.id IN ({placeholders})
+            """,  # noqa: S608
+            chunk_ids,
+        ).fetchall()
+        return [
+            ChunkFileInfo(
+                chunk_id=row["id"],
+                path=Path(row["path"]),
+                start_line=row["start_line"],
+                end_line=row["end_line"],
+                content=row["content"],
+            )
+            for row in rows
+        ]
+
+    def get_chunks_by_ids(self, chunk_ids: list[int]) -> list[StoredChunk]:
+        """Fetch specific chunks by their primary keys (order not guaranteed)."""
+        if not chunk_ids:
+            return []
+        placeholders = ",".join("?" * len(chunk_ids))
+        rows = self._conn.execute(
+            f"SELECT id, file_id, start_line, end_line, content FROM chunks WHERE id IN ({placeholders})",  # noqa: S608
+            chunk_ids,
+        ).fetchall()
+        return [
+            StoredChunk(
+                id=row["id"],
+                file_id=row["file_id"],
+                start_line=row["start_line"],
+                end_line=row["end_line"],
+                content=row["content"],
+            )
+            for row in rows
+        ]
+
     def get_chunks_for_file(self, file_id: int) -> list[StoredChunk]:
         """Return all chunks for a given file id, ordered by start_line."""
         rows = self._conn.execute(
@@ -215,3 +278,101 @@ class Repository:
         """Merge FTS index segments for faster query performance."""
         self._conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
         logger.debug("fts_optimized")
+
+    # ------------------------------------------------------------------
+    # Embedding operations
+    # ------------------------------------------------------------------
+
+    def upsert_embedding(
+        self,
+        chunk_id: int,
+        vector: list[float],
+        model: str,
+    ) -> None:
+        """Insert or replace the embedding for a single chunk."""
+        blob = _vec_to_blob(vector)
+        self._conn.execute(
+            """
+            INSERT INTO chunk_embeddings (chunk_id, embedding, model, dimensions, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id) DO UPDATE SET
+                embedding  = excluded.embedding,
+                model      = excluded.model,
+                dimensions = excluded.dimensions,
+                created_at = excluded.created_at
+            """,
+            (chunk_id, blob, model, len(vector), int(time.time())),
+        )
+
+    def upsert_embeddings_batch(
+        self,
+        chunk_ids: list[int],
+        vectors: list[list[float]],
+        model: str,
+    ) -> None:
+        """Insert or replace embeddings for multiple chunks in one transaction."""
+        now = int(time.time())
+        self._conn.executemany(
+            """
+            INSERT INTO chunk_embeddings (chunk_id, embedding, model, dimensions, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chunk_id) DO UPDATE SET
+                embedding  = excluded.embedding,
+                model      = excluded.model,
+                dimensions = excluded.dimensions,
+                created_at = excluded.created_at
+            """,
+            [
+                (cid, _vec_to_blob(vec), model, len(vec), now)
+                for cid, vec in zip(chunk_ids, vectors)
+            ],
+        )
+
+    def get_all_embeddings(self, model: str) -> list[tuple[int, list[float]]]:
+        """Return all ``(chunk_id, vector)`` pairs stored for *model*."""
+        rows = self._conn.execute(
+            "SELECT chunk_id, embedding FROM chunk_embeddings WHERE model = ?",
+            (model,),
+        ).fetchall()
+        return [(row["chunk_id"], _blob_to_vec(row["embedding"])) for row in rows]
+
+    def get_chunks_without_embeddings(self, model: str) -> list[StoredChunk]:
+        """Return chunks that have no embedding for *model* yet."""
+        rows = self._conn.execute(
+            """
+            SELECT c.id, c.file_id, c.start_line, c.end_line, c.content
+            FROM   chunks c
+            LEFT   JOIN chunk_embeddings e
+                   ON  e.chunk_id = c.id
+                   AND e.model    = ?
+            WHERE  e.chunk_id IS NULL
+            ORDER  BY c.id
+            """,
+            (model,),
+        ).fetchall()
+        return [
+            StoredChunk(
+                id=row["id"],
+                file_id=row["file_id"],
+                start_line=row["start_line"],
+                end_line=row["end_line"],
+                content=row["content"],
+            )
+            for row in rows
+        ]
+
+    def delete_embeddings_for_model(self, model: str) -> None:
+        """Delete all stored embeddings for *model* (used by ``--reembed``)."""
+        self._conn.execute(
+            "DELETE FROM chunk_embeddings WHERE model = ?",
+            (model,),
+        )
+        logger.info("embeddings_deleted", model=model)
+
+    def get_embedding_count(self, model: str) -> int:
+        """Return the number of stored embeddings for *model*."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM chunk_embeddings WHERE model = ?",
+            (model,),
+        ).fetchone()
+        return int(row[0])

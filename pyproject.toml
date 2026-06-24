@@ -12,6 +12,9 @@ dependencies = [
     "markitdown[docx,pdf,pptx,xlsx]>=0.1.6",
 ]
 
+[project.optional-dependencies]
+embeddings = ["sentence-transformers>=3.0.0", "einops>=0.7.0"]
+
 [project.scripts]
 ctx = "context_db.cli:app"
 
