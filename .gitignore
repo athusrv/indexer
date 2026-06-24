@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# uv
+uv.lock
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+
+# Testing & coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Database files generated at runtime
+*.db
+*.sqlite
+*.sqlite3
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
