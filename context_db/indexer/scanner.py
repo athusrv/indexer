@@ -98,8 +98,8 @@ DEFAULT_IGNORE_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
-# Maximum file size to index (4 MB). Larger files are skipped.
-MAX_FILE_BYTES: int = 4 * 1024 * 1024
+# Maximum file size to index (16 MB). Larger files are skipped.
+MAX_FILE_BYTES: int = 16 * 1024 * 1024
 
 
 class Scanner:
